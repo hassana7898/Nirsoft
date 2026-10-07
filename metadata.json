@@ -1,0 +1,6 @@
+{
+  "name": "NIRWARE NEXT",
+  "description": "سیستم جامع مدیریت هوشمند کارخانه خوراک طیور، مرغداران، رانندگان و لجستیک",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
