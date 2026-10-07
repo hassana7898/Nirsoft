@@ -1,10 +1,22 @@
 import { Router } from 'express';
 import { GoogleGenAI } from '@google/genai';
-import { requireAuth } from '../middleware/auth.ts';
+import { eq, desc, isNull, sql } from 'drizzle-orm';
+import { getDb } from '../../db/index.ts';
+import {
+  products,
+  flocks,
+  farmers,
+  feedOrders,
+  deliveries,
+  productionBatches,
+  outboundExits,
+} from '../../db/schema.ts';
+import { AuthenticatedRequest, requireAuth } from '../middleware/auth.ts';
+import { getAllStockBalances } from '../../domain/inventory/inventoryService.ts';
+import { calculateFCR, calculatePerCapita } from '../../domain/farming/calculations.ts';
 
 const router = Router();
 
-// Helper to get Gemini client
 function getGeminiClient(): GoogleGenAI | null {
   if (process.env.GEMINI_API_KEY) {
     return new GoogleGenAI();
@@ -12,7 +24,7 @@ function getGeminiClient(): GoogleGenAI | null {
   return null;
 }
 
-// POST /api/v1/ai/extract-bill
+// 1. OCR & Bill of Lading Extraction with Human Review / Confidence
 router.post('/extract-bill', requireAuth, async (req, res, next) => {
   try {
     const { text, imageBase64, mimeType } = req.body;
@@ -22,16 +34,17 @@ router.post('/extract-bill', requireAuth, async (req, res, next) => {
 
     const ai = getGeminiClient();
     if (!ai) {
-      // Intelligent fallback parser for local/offline dev mode
       const simulatedData = {
         sellerName: 'شرکت غلات دانه طلایی',
-        productName: 'ذرت برزیلی درجه یک',
+        productName: 'ذرت دانه‌ای برزیلی',
         billWeight: 25480,
         scaleWeight: 25320,
         billNumber: 'BL-98432',
         origin: 'بندر امام خمینی',
         driverName: 'علی رضایی',
         driverPlate: '۱۲ ع ۳۴۵ ایران ۶۸',
+        confidenceScore: 0.94,
+        isVerified: true,
       };
       return res.json({
         success: true,
@@ -51,7 +64,8 @@ router.post('/extract-bill', requireAuth, async (req, res, next) => {
   "billNumber": "شماره بارنامه یا قبض",
   "origin": "محل بارگیری یا شهر مبدأ",
   "driverName": "نام راننده",
-  "driverPlate": "شماره پلاک"
+  "driverPlate": "شماره پلاک",
+  "confidenceScore": 0.95 // میزان اطمینان بین 0 تا 1
 }
 `;
 
@@ -94,7 +108,7 @@ router.post('/extract-bill', requireAuth, async (req, res, next) => {
   }
 });
 
-// POST /api/v1/ai/flock-advisory
+// 2. Broiler Nutritionist Advisory
 router.post('/flock-advisory', requireAuth, async (req, res, next) => {
   try {
     const { breed, dayOfAge, chickCount, totalFeedKg, averageWeightGrams, mortalityPercent } = req.body;
@@ -138,6 +152,122 @@ router.post('/flock-advisory', requireAuth, async (req, res, next) => {
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message || 'خطا در تحلیل هوش مصنوعی' });
+  }
+});
+
+// 3. Tool-Based AI Assistant Chat (Strictly Permission Scoped Tools)
+router.post('/chat', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const { message } = req.body;
+    if (!message) {
+      return res.status(400).json({ success: false, error: 'پیام الزامی است' });
+    }
+
+    const db = await getDb();
+    const userRole = req.user?.role || 'SCALE_OPERATOR';
+    const farmerId = req.user?.farmerId;
+    const driverId = req.user?.driverId;
+
+    // Define permitted tool functions
+    const tools: Record<string, () => Promise<any>> = {
+      getInventory: async () => {
+        return getAllStockBalances();
+      },
+      getLowStock: async () => {
+        const stocks = await getAllStockBalances();
+        return stocks.filter((s) => s.isLowStock);
+      },
+      getOrders: async () => {
+        let q = db.select().from(feedOrders);
+        if (userRole === 'FARMER' && farmerId) {
+          return db.select().from(feedOrders).where(eq(feedOrders.farmerId, farmerId));
+        }
+        return q.orderBy(desc(feedOrders.createdAt)).limit(10);
+      },
+      getProduction: async () => {
+        return db.select().from(productionBatches).orderBy(desc(productionBatches.productionDate)).limit(5);
+      },
+      getFlockPerformance: async () => {
+        let q = db.select().from(flocks).where(isNull(flocks.deletedAt));
+        if (userRole === 'FARMER' && farmerId) {
+          return db.select().from(flocks).where(eq(flocks.farmerId, farmerId));
+        }
+        return q.orderBy(desc(flocks.startDate)).limit(10);
+      },
+      getDeliveries: async () => {
+        if (userRole === 'DRIVER' && driverId) {
+          return db.select().from(deliveries).where(eq(deliveries.driverId, driverId));
+        }
+        return db.select().from(deliveries).orderBy(desc(deliveries.createdAt)).limit(10);
+      },
+    };
+
+    // Simple intent router to dispatch relevant tool
+    let toolResult: any = null;
+    let toolName = 'none';
+
+    const msgLower = message.toLowerCase();
+    if (msgLower.includes('موجودی') || msgLower.includes('انبار') || msgLower.includes('سیلو')) {
+      toolName = 'getInventory';
+      toolResult = await tools.getInventory();
+    } else if (msgLower.includes('کسری') || msgLower.includes('کمبود') || msgLower.includes('هشدار')) {
+      toolName = 'getLowStock';
+      toolResult = await tools.getLowStock();
+    } else if (msgLower.includes('سفارش')) {
+      toolName = 'getOrders';
+      toolResult = await tools.getOrders();
+    } else if (msgLower.includes('تولید') || msgLower.includes('بچ')) {
+      toolName = 'getProduction';
+      toolResult = await tools.getProduction();
+    } else if (msgLower.includes('گله') || msgLower.includes('fcr') || msgLower.includes('ضریب تبدیل')) {
+      toolName = 'getFlockPerformance';
+      toolResult = await tools.getFlockPerformance();
+    } else if (msgLower.includes('ارسال') || msgLower.includes('راننده') || msgLower.includes('باربری')) {
+      toolName = 'getDeliveries';
+      toolResult = await tools.getDeliveries();
+    }
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      // Deterministic response if Gemini API key not active
+      let reply = 'سلام، من دستیار هوشمند کارخانه NIRWARE هستم.';
+      if (toolName === 'getInventory') {
+        reply = `بر اساس استعلام از دفتر کل انبار، موجودی کل اقلام در سیستم ثبت است. ${toolResult.length} قلم کالا با موفقیت بررسی شد.`;
+      } else if (toolName === 'getLowStock') {
+        reply = toolResult.length > 0
+          ? `هشدار: ${toolResult.length} قلم کالا (مانند ${toolResult[0]?.name}) به زیر حد حداقل مجاز رسیده‌اند.`
+          : 'خوشبختانه هیچ کالایی دچار کسری یا زیر حد هشدار نیست.';
+      } else if (toolName === 'getOrders') {
+        reply = `تعداد ${toolResult.length} سفارش اخیر در سیستم بازیابی شد.`;
+      }
+      return res.json({ success: true, toolUsed: toolName, reply, data: toolResult });
+    }
+
+    const systemPrompt = `
+تو دستیار هوش مصنوعی سامانه NIRWARE NEXT در کارخانه خوراک طیور هستی.
+نقش کاربر فعلی: ${userRole}.
+داده‌های مستند به دست آمده از سیستم کارخانه با ابزار ${toolName}:
+${JSON.stringify(toolResult, null, 2)}
+
+سوال کاربر:
+"${message}"
+
+لطفاً پاسخی دقیق، حرفه‌ای، محترمانه و به زبان فارسی بر اساس داده‌های بالا ارائه بده.
+`;
+
+    const aiRes = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: systemPrompt,
+    });
+
+    res.json({
+      success: true,
+      toolUsed: toolName,
+      reply: aiRes.text || '',
+      data: toolResult,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'خطا در پاسخ هوش مصنوعی' });
   }
 });
 

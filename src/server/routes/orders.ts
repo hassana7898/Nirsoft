@@ -125,8 +125,8 @@ router.post('/', requireAuth, async (req: AuthenticatedRequest, res, next) => {
   }
 });
 
-// POST /api/v1/orders/:id/transition (State machine transition)
-router.post('/:id/transition', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+// Handler for transitioning order status
+async function handleOrderTransition(req: AuthenticatedRequest, res: any, next: any) {
   try {
     const orderId = req.params.id;
     const { action, notes } = req.body;
@@ -141,7 +141,7 @@ router.post('/:id/transition', requireAuth, async (req: AuthenticatedRequest, re
     }
 
     // Role check
-    if (!req.user || !transitionRule.allowedRoles.includes(req.user.role)) {
+    if (!req.user || (!transitionRule.allowedRoles.includes(req.user.role) && req.user.role !== 'SUPER_ADMIN')) {
       res.status(403).json({
         success: false,
         error: { code: 'FORBIDDEN', message: 'شما دسترسی لازم برای تغییر وضعیت این سفارش به حالت درخواستی را ندارید.' },
@@ -183,7 +183,7 @@ router.post('/:id/transition', requireAuth, async (req: AuthenticatedRequest, re
       entityId: orderId,
       oldState: { status: order.status },
       newState: { status: nextState, notes },
-      requestId: req.id,
+      requestId: req.requestId,
     });
 
     res.json({
@@ -198,6 +198,10 @@ router.post('/:id/transition', requireAuth, async (req: AuthenticatedRequest, re
   } catch (err) {
     next(err);
   }
-});
+}
+
+// POST /api/v1/orders/:id/transition & POST /api/v1/orders/:id/action
+router.post('/:id/transition', requireAuth, handleOrderTransition);
+router.post('/:id/action', requireAuth, handleOrderTransition);
 
 export default router;

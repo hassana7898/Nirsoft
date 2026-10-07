@@ -25,6 +25,10 @@ import logisticsRouter from './src/server/routes/logistics.ts';
 import reportsRouter from './src/server/routes/reports.ts';
 import migrationRouter from './src/server/routes/migration.ts';
 import aiRouter from './src/server/routes/ai.ts';
+import portalRouter from './src/server/routes/portal.ts';
+import mergingRouter from './src/server/routes/merging.ts';
+import excelRouter from './src/server/routes/excel.ts';
+import { apiRateLimiter } from './src/server/middleware/rateLimiter.ts';
 
 dotenv.config();
 
@@ -72,6 +76,8 @@ app.use(cookieParser());
 app.use(requestIdMiddleware);
 app.use(authenticate);
 
+app.use('/api', apiRateLimiter);
+
 // 2. API v1 Domain Routes
 app.use('/api/v1', healthRouter);
 app.use('/api/v1/auth', authRouter);
@@ -85,6 +91,9 @@ app.use('/api/v1/logistics', logisticsRouter);
 app.use('/api/v1/reports', reportsRouter);
 app.use('/api/v1/migration', migrationRouter);
 app.use('/api/v1/ai', aiRouter);
+app.use('/api/v1/portal', portalRouter);
+app.use('/api/v1/merging', mergingRouter);
+app.use('/api/v1/excel', excelRouter);
 
 // Legacy health aliases for standard container monitoring
 app.get('/health', (req, res) => res.redirect('/api/v1/health'));
@@ -100,9 +109,11 @@ async function startServer() {
     await initDb();
     console.log('[NIRWARE NEXT] PostgreSQL schema & tables initialized successfully.');
 
-    // Run safe development seed
-    await runDevelopmentSeed();
-    console.log('[NIRWARE NEXT] Development seed data verified.');
+    // Run safe development seed (only in development / non-production)
+    if (process.env.NODE_ENV !== 'production') {
+      await runDevelopmentSeed();
+      console.log('[NIRWARE NEXT] Development seed data verified.');
+    }
 
     if (process.env.NODE_ENV === 'production') {
       const distPath = path.join(__dirname, 'dist');

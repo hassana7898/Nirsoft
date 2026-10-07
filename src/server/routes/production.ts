@@ -1,17 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { eq, desc, and } from 'drizzle-orm';
-import crypto from 'crypto';
+import { eq, desc } from 'drizzle-orm';
 import { getDb } from '../../db/index.ts';
 import {
   productionBatches,
   formulas,
-  formulaItems,
   products,
   inventoryLedger,
 } from '../../db/schema.ts';
 import { AuthenticatedRequest, requireAuth, requireRole } from '../middleware/auth.ts';
-import { logAuditEvent } from '../services/auditService.ts';
+import { executeProductionBatch } from '../../domain/production/productionService.ts';
 
 const router = Router();
 
@@ -63,92 +61,24 @@ router.post(
   async (req: AuthenticatedRequest, res, next) => {
     try {
       const data = createBatchSchema.parse(req.body);
-      const db = await getDb();
 
-      // Fetch the formula and formula items
-      const formulaRecord = await db.select().from(formulas).where(eq(formulas.id, data.formulaId));
-      if (!formulaRecord[0]) {
-        return res.status(404).json({ success: false, error: 'فرمول مورد نظر یافت نشد' });
-      }
-
-      const items = await db.select().from(formulaItems).where(eq(formulaItems.formulaId, data.formulaId));
-      if (items.length === 0) {
-        return res.status(400).json({ success: false, error: 'فرمول انتخاب شده فاقد اقلام مواد اولیه است' });
-      }
-
-      const batchBasis = parseFloat(formulaRecord[0].batchBasisKg) || 1000;
-      const ratio = data.plannedQuantityKg / batchBasis;
-
-      const batchId = crypto.randomUUID();
-      const randCode = Math.floor(1000 + Math.random() * 9000);
-      const batchNumber = `BATCH-${data.productionDate.replace(/-/g, '')}-${randCode}`;
-
-      // Insert production batch
-      await db.insert(productionBatches).values({
-        id: batchId,
-        batchNumber,
+      const result = await executeProductionBatch({
         productionDate: data.productionDate,
         finishedGoodId: data.finishedGoodId,
         formulaId: data.formulaId,
-        plannedQuantityKg: data.plannedQuantityKg.toString(),
-        actualQuantityKg: data.actualQuantityKg.toString(),
-        wasteKg: (data.wasteKg || 0).toString(),
-        operatorName: data.operatorName || 'اپراتور تولید',
-        createdBy: req.user?.id || null,
-      });
-
-      // Deduct each raw material based on formula recipe
-      for (const item of items) {
-        const itemQtyKg = (parseFloat(item.quantityKg) || 0) * ratio;
-        const ledgerId = crypto.randomUUID();
-        await db.insert(inventoryLedger).values({
-          id: ledgerId,
-          transactionDate: data.productionDate,
-          productId: item.rawMaterialId,
-          action: 'PRODUCTION_CONSUMPTION',
-          quantityChange: (-itemQtyKg).toString(),
-          referenceEntity: 'production_batches',
-          referenceId: batchId,
-          reason: `مصرف در بچ تولید ${batchNumber} (${data.plannedQuantityKg} کیلوگرم)`,
-          createdBy: req.user?.id || null,
-        });
-      }
-
-      // Add finished feed into inventory
-      const finishedLedgerId = crypto.randomUUID();
-      await db.insert(inventoryLedger).values({
-        id: finishedLedgerId,
-        transactionDate: data.productionDate,
-        productId: data.finishedGoodId,
-        action: 'PRODUCTION_OUTPUT',
-        quantityChange: data.actualQuantityKg.toString(),
-        referenceEntity: 'production_batches',
-        referenceId: batchId,
-        reason: `تولید دان آماده در بچ شماره ${batchNumber}`,
-        createdBy: req.user?.id || null,
-      });
-
-      await logAuditEvent({
+        plannedQuantityKg: data.plannedQuantityKg,
+        actualQuantityKg: data.actualQuantityKg,
+        wasteKg: data.wasteKg,
+        operatorName: data.operatorName,
         userId: req.user?.id,
         userPhone: req.user?.phoneNumber,
-        action: 'EXECUTE_PRODUCTION_BATCH',
-        entityType: 'production_batches',
-        entityId: batchId,
-        newState: {
-          batchNumber,
-          finishedGoodId: data.finishedGoodId,
-          actualQuantityKg: data.actualQuantityKg,
-          rawMaterialsCount: items.length,
-        },
-        ipAddress: req.ip,
-        userAgent: req.headers['user-agent'],
         requestId: req.requestId,
       });
 
       res.status(201).json({
         success: true,
-        message: 'بچ تولید با موفقیت ثبت شد و کسر مواد اولیه و افزایش دان آماده اعمال گردید',
-        data: { id: batchId, batchNumber },
+        message: 'بچ تولید با موفقیت در تراکنش اتمیک ثبت شد و کسر مواد اولیه و ورود دان آماده اعمال گردید',
+        data: result,
       });
     } catch (err) {
       next(err);
@@ -182,7 +112,6 @@ router.get('/batches/:id', requireAuth, async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'بچ تولید یافت نشد' });
     }
 
-    // Ledger consumption details for this batch
     const consumptions = await db
       .select({
         id: inventoryLedger.id,
@@ -194,10 +123,7 @@ router.get('/batches/:id', requireAuth, async (req, res, next) => {
       .from(inventoryLedger)
       .leftJoin(products, eq(inventoryLedger.productId, products.id))
       .where(
-        and(
-          eq(inventoryLedger.referenceEntity, 'production_batches'),
-          eq(inventoryLedger.referenceId, req.params.id)
-        )
+        eq(inventoryLedger.referenceId, req.params.id)
       );
 
     res.json({

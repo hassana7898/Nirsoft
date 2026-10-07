@@ -18,25 +18,40 @@ export async function getDb(): Promise<DbType> {
   }
 
   const databaseUrl = process.env.DATABASE_URL;
-  const useRemotePg = databaseUrl && databaseUrl.startsWith('postgres') && !databaseUrl.includes('localhost:5432');
+  const isProduction = process.env.NODE_ENV === 'production';
 
-  if (useRemotePg) {
+  // 1. Production or explicit DATABASE_URL configuration
+  if (databaseUrl && (databaseUrl.startsWith('postgres://') || databaseUrl.startsWith('postgresql://'))) {
     try {
       pgPoolInstance = new Pool({
         connectionString: databaseUrl,
-        max: 10,
+        max: 20,
+        idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 10000,
       });
+
+      // Verify connection
+      const client = await pgPoolInstance.connect();
+      client.release();
+
       activeDb = drizzlePg(pgPoolInstance, { schema });
+      console.log('[NIRWARE NEXT] Connected to external PostgreSQL database via Pool.');
       return activeDb;
     } catch (err) {
-      console.warn('Could not connect to external PostgreSQL, falling back to embedded PostgreSQL (PGlite):', err);
+      console.error('[NIRWARE NEXT] Critical error connecting to PostgreSQL server:', err);
+      if (isProduction) {
+        throw new Error(`Production database connection failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      console.warn('[NIRWARE NEXT] Falling back to embedded PGlite for development/testing...');
     }
   }
 
-  // Embedded PostgreSQL engine (PGlite)
+  if (isProduction && !databaseUrl) {
+    throw new Error('DATABASE_URL must be specified in production environment.');
+  }
+
+  // 2. Embedded PostgreSQL engine (PGlite) for local development and test suites
   if (!pgliteInstance) {
-    // In-memory or local persistent directory
     pgliteInstance = new PGlite();
     await pgliteInstance.waitReady;
   }
@@ -46,7 +61,7 @@ export async function getDb(): Promise<DbType> {
 }
 
 export async function initDb(): Promise<void> {
-  const db = await getDb();
+  await getDb();
 
   // Create tables, enums and indexes using PostgreSQL DDL
   const initSql = `
@@ -421,25 +436,34 @@ export async function initDb(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_audit_created_at ON audit_logs(created_at);
   `;
 
-  if (pgliteInstance) {
-    await pgliteInstance.exec(initSql);
-  } else if (pgPoolInstance) {
+  if (pgPoolInstance) {
     await pgPoolInstance.query(initSql);
+  } else if (pgliteInstance) {
+    await pgliteInstance.exec(initSql);
   }
 }
 
 export async function checkDatabaseHealth(): Promise<{ isHealthy: boolean; driver: string; error?: string }> {
   try {
+    if (pgPoolInstance) {
+      const res = await pgPoolInstance.query('SELECT 1 as alive;');
+      return { isHealthy: res.rows.length > 0, driver: 'PostgreSQL Server (External Pool)' };
+    }
     if (pgliteInstance) {
       const res = await pgliteInstance.query('SELECT 1 as alive;');
       return { isHealthy: res.rows.length > 0, driver: 'PGlite (Embedded PostgreSQL 15/16 Engine)' };
-    }
-    if (pgPoolInstance) {
-      const res = await pgPoolInstance.query('SELECT 1 as alive;');
-      return { isHealthy: res.rows.length > 0, driver: 'PostgreSQL Pool (Client)' };
     }
     return { isHealthy: false, driver: 'None', error: 'Database uninitialized' };
   } catch (err: any) {
     return { isHealthy: false, driver: 'Unknown', error: err?.message || String(err) };
   }
+}
+
+/**
+ * Executes a callback within a managed database transaction.
+ * If the callback throws, changes are automatically rolled back.
+ */
+export async function withTransaction<T>(callback: (tx: any) => Promise<T>): Promise<T> {
+  const db = await getDb();
+  return (db as any).transaction(callback);
 }
